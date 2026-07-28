@@ -949,3 +949,34 @@ Private Function CleanLogText( _
     CleanLogText = cleanedText
 
 End Function
+
+
+
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/sp/v2/column-formatting.schema.json",
+  "elmType": "a",
+  "style": {
+    "display": "=if(@currentField == '', 'none', 'inline-flex')",
+    "align-items": "center",
+    "gap": "6px",
+    "text-decoration": "none",
+    "font-weight": "600"
+  },
+  "attributes": {
+    "href": "@currentField",
+    "target": "_blank",
+    "title": "リンク先を新しいタブで開きます"
+  },
+  "children": [
+    {
+      "elmType": "span",
+      "attributes": {
+        "iconName": "OpenInNewWindow"
+      }
+    },
+    {
+      "elmType": "span",
+      "txtContent": "リンクを開く"
+    }
+  ]
+}
