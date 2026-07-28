@@ -980,3 +980,12 @@ End Function
     }
   ]
 }
+
+
+
+
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/sp/v2/column-formatting.schema.json",
+  "elmType": "span",
+  "txtContent": "=if([$利用者名] != '', [$利用者名], if(indexOf([$Author.title], ' ') >= 0, substring([$Author.title], 0, indexOf([$Author.title], ' ')), [$Author.title]))"
+}
