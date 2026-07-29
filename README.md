@@ -989,3 +989,161 @@ End Function
   "elmType": "span",
   "txtContent": "=if([$利用者名] != '', [$利用者名], if(indexOf([$Author.title], ' ') >= 0, substring([$Author.title], 0, indexOf([$Author.title], ' ')), [$Author.title]))"
 }
+
+
+
+
+
+let
+    PDFファイルパス =
+        "C:\資料\対象ファイル.pdf",
+
+    // PDF内のTable・Page一覧を取得
+    ソース =
+        Pdf.Tables(
+            File.Contents(PDFファイルパス),
+            [
+                Implementation = "1.3",
+                MultiPageTables = false
+            ]
+        ),
+
+    // Pageだけを抽出
+    Pageのみ =
+        Table.SelectRows(
+            ソース,
+            each [Kind] = "Page"
+        ),
+
+    // ページ順に並べる
+    Page順 =
+        Table.Sort(
+            Pageのみ,
+            {
+                {"Id", Order.Ascending}
+            }
+        ),
+
+    // 各Pageに連番を付ける
+    Page番号追加 =
+        Table.AddIndexColumn(
+            Page順,
+            "PageNo",
+            1,
+            1,
+            Int64.Type
+        ),
+
+    // 各ページの列名にPage番号を付ける
+    列名変更 =
+        Table.AddColumn(
+            Page番号追加,
+            "加工後Data",
+            each
+                let
+                    現在Page番号 =
+                        Text.PadStart(
+                            Text.From([PageNo]),
+                            3,
+                            "0"
+                        ),
+
+                    元Data =
+                        [Data],
+
+                    元列名 =
+                        Table.ColumnNames(元Data),
+
+                    新列名 =
+                        List.Transform(
+                            元列名,
+                            each
+                                "Page"
+                                & 現在Page番号
+                                & "_"
+                                & _
+                        ),
+
+                    列名対応 =
+                        List.Zip(
+                            {
+                                元列名,
+                                新列名
+                            }
+                        ),
+
+                    名前変更後 =
+                        Table.RenameColumns(
+                            元Data,
+                            列名対応,
+                            MissingField.Ignore
+                        )
+                in
+                    名前変更後
+        ),
+
+    // 各Pageのテーブルをリストとして取得
+    Pageテーブル一覧 =
+        列名変更[加工後Data],
+
+    // 最大行数を取得
+    最大行数 =
+        if List.Count(Pageテーブル一覧) = 0 then
+            0
+        else
+            List.Max(
+                List.Transform(
+                    Pageテーブル一覧,
+                    each Table.RowCount(_)
+                )
+            ),
+
+    // 各Pageに行番号を付ける
+    行番号付き =
+        List.Transform(
+            Pageテーブル一覧,
+            each
+                Table.AddIndexColumn(
+                    _,
+                    "結合用行番号",
+                    1,
+                    1,
+                    Int64.Type
+                )
+        ),
+
+    // 先頭Pageを基準に横結合
+    横結合 =
+        if List.Count(行番号付き) = 0 then
+            #table({}, {})
+        else
+            List.Accumulate(
+                List.Skip(行番号付き, 1),
+                List.First(行番号付き),
+                (結合済み, 次Page) =>
+                    Table.Join(
+                        結合済み,
+                        "結合用行番号",
+                        次Page,
+                        "結合用行番号",
+                        JoinKind.FullOuter
+                    )
+            ),
+
+    // 行番号で並べる
+    行順整理 =
+        Table.Sort(
+            横結合,
+            {
+                {"結合用行番号", Order.Ascending}
+            }
+        ),
+
+    // 結合用行番号を削除
+    行番号削除 =
+        Table.RemoveColumns(
+            行順整理,
+            {"結合用行番号"}
+        )
+in
+    行番号削除
