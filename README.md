@@ -5,45 +5,35 @@ Option Explicit
 ' 設定
 '============================================================
 
-' 受信トレイ直下に作成するフォルダ名
+' 受信トレイ直下の一時保存フォルダ名
 Private Const TEMP_FOLDER_NAME As String = "一時保存"
 
 ' ドキュメントフォルダ内の保存先フォルダ名
 Private Const SAVE_FOLDER_NAME As String = "受信メール"
 
-' 正常保存時または重複スキップ時の分類項目
-Private Const SAVED_CATEGORY As String = "保存済み"
-
-' エラー発生時の分類項目
-Private Const ERROR_CATEGORY As String = "保存処理エラー"
-
-' 保存先パスをメール内に記録するユーザー定義プロパティ
-Private Const SAVE_PATH_PROPERTY As String = "VBA_MSG_SAVE_PATH"
-
-' ファイル名の日付・時刻部分
+' ファイル名に使用する日時
 '
-' VBAでは、
-' 月 = mm
-' 分 = nn
+' 例：
+' 20260807_172530_山田太郎_資料送付.msg
 '
-' 作成例：
-' 20260804_083105_差出人_件名.msg
+' VBAでは「分」は nn
 Private Const DATE_FORMAT As String = "yyyymmdd_hhnnss"
 
-' Windowsのパス長制限を考慮した安全側の上限
+' パスが長くなりすぎることを防ぐための上限
 Private Const MAX_PATH_LENGTH As Long = 240
 
 '============================================================
-' イベント監視用変数
+' イベント監視用
 '============================================================
 
 Private WithEvents mTemporaryItems As Outlook.Items
 
-' 多重実行防止
+' 二重処理防止
 Private mIsProcessing As Boolean
 
+
 '============================================================
-' Outlook起動時の処理
+' Outlook起動時
 '============================================================
 
 Private Sub Application_Startup()
@@ -52,11 +42,16 @@ Private Sub Application_Startup()
 
 End Sub
 
+
 '============================================================
-' 初期化処理
+' 初期化
 '
 ' Outlook起動時に自動実行される。
-' Alt + F8から手動実行することも可能。
+'
+' Alt + F8
+' → InitializeMailSaver
+'
+' から手動実行することも可能。
 '============================================================
 
 Public Sub InitializeMailSaver()
@@ -68,20 +63,18 @@ Public Sub InitializeMailSaver()
     ' 一時保存フォルダを取得
     Set tempFolder = GetTemporaryFolder()
 
-    ' 一時保存フォルダのアイテム追加イベントを監視
+    ' フォルダへのメール追加を監視
     Set mTemporaryItems = tempFolder.Items
 
-    ' 保存先フォルダを作成
+    ' 保存先フォルダがなければ作成
     EnsureFolderExists GetSaveFolderPath()
 
-    ' 分類項目を作成
-    EnsureMasterCategory SAVED_CATEGORY
-    EnsureMasterCategory ERROR_CATEGORY
-
-    ' Outlook停止中などに残っていたメールも処理
+    ' Outlook停止中などに一時保存フォルダへ
+    ' 残っていたメールも処理
     ProcessTemporaryFolderNow
 
     Exit Sub
+
 
 ErrorHandler:
 
@@ -96,6 +89,7 @@ ErrorHandler:
 
 End Sub
 
+
 '============================================================
 ' 一時保存フォルダにアイテムが追加されたとき
 '============================================================
@@ -106,10 +100,14 @@ Private Sub mTemporaryItems_ItemAdd(ByVal Item As Object)
 
 End Sub
 
+
 '============================================================
-' 一時保存フォルダ内のメールを一括処理
+' 一時保存フォルダ内のメールをすべて処理
 '
-' Alt + F8から手動実行することも可能。
+' 手動実行も可能
+'
+' Alt + F8
+' → ProcessTemporaryFolderNow
 '============================================================
 
 Public Sub ProcessTemporaryFolderNow()
@@ -121,6 +119,7 @@ Public Sub ProcessTemporaryFolderNow()
     Dim errorNumber As Long
     Dim errorDescription As String
 
+    ' すでに処理中なら実行しない
     If mIsProcessing Then Exit Sub
 
     mIsProcessing = True
@@ -129,25 +128,32 @@ Public Sub ProcessTemporaryFolderNow()
 
     Set tempFolder = GetTemporaryFolder()
 
+    ' 保存先がなければ作成
     EnsureFolderExists GetSaveFolderPath()
 
-    ' 処理中にメールを移動するため末尾から処理する
+    ' メールを処理中にフォルダから移動するので
+    ' 下から上へ処理する
     For itemIndex = tempFolder.Items.Count To 1 Step -1
 
         Set currentItem = tempFolder.Items.Item(itemIndex)
 
         If TypeOf currentItem Is Outlook.MailItem Then
+
             ProcessOneMail currentItem
+
         End If
 
         Set currentItem = Nothing
 
     Next itemIndex
 
+
 CleanExit:
 
     mIsProcessing = False
+
     Exit Sub
+
 
 ErrorHandler:
 
@@ -169,15 +175,15 @@ ErrorHandler:
 
 End Sub
 
+
 '============================================================
-' メール1件の保存処理
+' メール1件を処理
 '============================================================
 
 Private Sub ProcessOneMail(ByVal mail As Outlook.MailItem)
 
     Dim saveFolderPath As String
     Dim savePath As String
-    Dim registeredPath As String
 
     Dim senderText As String
     Dim subjectText As String
@@ -187,9 +193,13 @@ Private Sub ProcessOneMail(ByVal mail As Outlook.MailItem)
 
     Dim errorNumber As Long
     Dim errorDescription As String
-    Dim fileExistsAfterError As Boolean
 
     On Error GoTo ErrorHandler
+
+
+    '--------------------------------------------------------
+    ' 保存先取得
+    '--------------------------------------------------------
 
     saveFolderPath = GetSaveFolderPath()
 
@@ -197,113 +207,100 @@ Private Sub ProcessOneMail(ByVal mail As Outlook.MailItem)
 
     Set inboxFolder = GetInboxFolder()
 
-    '--------------------------------------------------------
-    ' 以前の処理で保存先パスがメール内に記録されている場合
-    '
-    ' MSG保存後、受信トレイへの移動だけ失敗した場合などは、
-    ' MSGを再保存せず、受信トレイへの移動だけを行う。
-    '--------------------------------------------------------
-
-    registeredPath = GetRegisteredSavePath(mail)
-
-    If Len(registeredPath) > 0 Then
-
-        savePath = registeredPath
-
-        If FileExists(registeredPath) Then
-
-            RemoveCategoryIfPresent mail, ERROR_CATEGORY
-            AddCategoryIfMissing mail, SAVED_CATEGORY
-
-            mail.Save
-            mail.Move inboxFolder
-
-            Exit Sub
-
-        Else
-
-            ' 記録されたファイルが存在しない場合は記録を削除
-            ClearRegisteredSavePath mail
-
-        End If
-
-    End If
 
     '--------------------------------------------------------
-    ' ファイル名の作成
+    ' 差出人名
     '--------------------------------------------------------
 
     senderText = CleanFileComponent( _
         mail.SenderName, _
         "差出人不明")
 
+    ' 差出人名が極端に長い場合は短縮
+    If Len(senderText) > 60 Then
+
+        senderText = Left$(senderText, 60)
+
+    End If
+
+
+    '--------------------------------------------------------
+    ' 件名
+    '--------------------------------------------------------
+
     subjectText = CleanFileComponent( _
         mail.Subject, _
         "件名なし")
 
-    ' 差出人名が長すぎる場合に短縮
-    senderText = Left$(senderText, 60)
+
+    '--------------------------------------------------------
+    ' ファイル名作成
+    '
+    ' 例：
+    '
+    ' 20260807_172530_山田太郎_資料送付.msg
+    '--------------------------------------------------------
 
     fileStem = _
         Format$(mail.ReceivedTime, DATE_FORMAT) & "_" & _
         senderText & "_" & _
         subjectText
 
+
+    '--------------------------------------------------------
     ' パス全体が長くなりすぎないように調整
+    '--------------------------------------------------------
+
     fileStem = FitFileStemToPath( _
         saveFolderPath, _
         fileStem, _
         ".msg")
 
+
     savePath = _
         saveFolderPath & "\" & fileStem & ".msg"
 
+
     '--------------------------------------------------------
-    ' 同名ファイルが存在する場合
+    ' 同名ファイルがすでに存在する場合
     '
-    ' MSG保存は行わず、既存ファイルを保存済みとみなす。
+    ' ・MSG保存しない
+    ' ・重複スキップログへ記録
+    ' ・メールを受信トレイへ移動
     '--------------------------------------------------------
 
     If FileExists(savePath) Then
 
-        RemoveCategoryIfPresent mail, ERROR_CATEGORY
-        AddCategoryIfMissing mail, SAVED_CATEGORY
+        WriteDuplicateLog _
+            mail, _
+            savePath
 
-        ' 既存ファイルのパスをメール内に記録
-        SetRegisteredSavePath mail, savePath
-
-        mail.Save
-
-        ' 重複スキップログを出力
-        WriteDuplicateLog mail, savePath
-
-        ' 受信トレイへ戻す
         mail.Move inboxFolder
 
         Exit Sub
 
     End If
 
+
     '--------------------------------------------------------
-    ' 通常の保存処理
+    ' MSG形式で保存
     '--------------------------------------------------------
 
-    RemoveCategoryIfPresent mail, ERROR_CATEGORY
-    AddCategoryIfMissing mail, SAVED_CATEGORY
+    mail.SaveAs _
+        savePath, _
+        olMSGUnicode
 
-    ' 保存予定パスをメール内に記録
-    SetRegisteredSavePath mail, savePath
 
-    ' 分類項目とユーザー定義プロパティを保存
-    mail.Save
+    '--------------------------------------------------------
+    ' MSG保存成功後
+    '
+    ' 受信トレイへ移動
+    '--------------------------------------------------------
 
-    ' Unicode対応のMSG形式で保存
-    mail.SaveAs savePath, olMSGUnicode
-
-    ' 保存成功後に受信トレイへ移動
     mail.Move inboxFolder
 
     Exit Sub
+
 
 ErrorHandler:
 
@@ -312,31 +309,6 @@ ErrorHandler:
 
     On Error Resume Next
 
-    ' savePathが未設定ならメール内の記録を確認
-    If Len(savePath) = 0 Then
-        savePath = GetRegisteredSavePath(mail)
-    End If
-
-    fileExistsAfterError = False
-
-    If Len(savePath) > 0 Then
-        fileExistsAfterError = FileExists(savePath)
-    End If
-
-    ' MSGファイルが作成されていない場合は保存済み扱いを取り消す
-    If Not fileExistsAfterError Then
-
-        ClearRegisteredSavePath mail
-        RemoveCategoryIfPresent mail, SAVED_CATEGORY
-
-    End If
-
-    ' エラーカテゴリを設定
-    AddCategoryIfMissing mail, ERROR_CATEGORY
-
-    mail.Save
-
-    ' エラーログを出力
     WriteErrorLog _
         mail, _
         "メール保存処理", _
@@ -346,12 +318,16 @@ ErrorHandler:
 
     On Error GoTo 0
 
+    ' エラーになったメールは受信トレイへ移動しない。
+    ' 一時保存フォルダへ残す。
+
 End Sub
 
+
 '============================================================
-' 一時保存フォルダを取得
+' 一時保存フォルダ取得
 '
-' 想定するフォルダ構成：
+' 想定：
 '
 ' 受信トレイ
 ' └ 一時保存
@@ -372,22 +348,26 @@ Private Function GetTemporaryFolder() As Outlook.Folder
 
     On Error GoTo 0
 
+
     If tempFolder Is Nothing Then
 
         Err.Raise _
             vbObjectError + 1001, _
             "GetTemporaryFolder", _
-            "受信トレイ直下に「" & TEMP_FOLDER_NAME & _
+            "受信トレイ直下に「" & _
+            TEMP_FOLDER_NAME & _
             "」フォルダが見つかりません。"
 
     End If
+
 
     Set GetTemporaryFolder = tempFolder
 
 End Function
 
+
 '============================================================
-' 受信トレイを取得
+' 受信トレイ取得
 '============================================================
 
 Private Function GetInboxFolder() As Outlook.Folder
@@ -397,13 +377,20 @@ Private Function GetInboxFolder() As Outlook.Folder
 
 End Function
 
+
 '============================================================
-' 保存先フォルダを取得
+' 保存先フォルダ取得
 '
-' Windowsが認識している実際のドキュメントフォルダを取得する。
+' Windowsが認識している実際の
+' 「ドキュメント」フォルダを取得する。
 '
-' 例：
-' C:\Users\ユーザー名\OneDrive - 会社名\Documents\受信メール
+' 会社PCの例：
+'
+' C:\Users\ユーザー名\
+' OneDrive - 会社名\
+' Documents\
+' 受信メール
+'
 '============================================================
 
 Private Function GetSaveFolderPath() As String
@@ -411,10 +398,12 @@ Private Function GetSaveFolderPath() As String
     Dim shellObject As Object
     Dim documentsPath As String
 
-    Set shellObject = CreateObject("WScript.Shell")
+    Set shellObject = _
+        CreateObject("WScript.Shell")
 
     documentsPath = _
         CStr(shellObject.SpecialFolders("MyDocuments"))
+
 
     If Len(Trim$(documentsPath)) = 0 Then
 
@@ -425,27 +414,55 @@ Private Function GetSaveFolderPath() As String
 
     End If
 
+
     GetSaveFolderPath = _
         documentsPath & "\" & SAVE_FOLDER_NAME
 
 End Function
 
+
 '============================================================
-' 保存先を確認するためのマクロ
+' 実際の保存先を画面表示
 '
-' Alt + F8からShowSaveFolderPathを実行すると、
-' 実際の保存先が表示される。
+' Alt + F8
+' → ShowSaveFolderPath
+'
+' で確認可能
 '============================================================
 
 Public Sub ShowSaveFolderPath()
 
     MsgBox _
-        "メールの保存先は次のフォルダです。" & vbCrLf & vbCrLf & _
+        "メールの保存先は次のフォルダです。" & _
+        vbCrLf & vbCrLf & _
         GetSaveFolderPath(), _
         vbInformation, _
         "MSG保存先"
 
 End Sub
+
+
+'============================================================
+' 保存先フォルダをエクスプローラーで開く
+'
+' Alt + F8
+' → OpenSaveFolder
+'============================================================
+
+Public Sub OpenSaveFolder()
+
+    Dim saveFolderPath As String
+
+    saveFolderPath = GetSaveFolderPath()
+
+    EnsureFolderExists saveFolderPath
+
+    Shell _
+        "explorer.exe """ & saveFolderPath & """", _
+        vbNormalFocus
+
+End Sub
+
 
 '============================================================
 ' フォルダが存在しない場合は作成
@@ -459,43 +476,63 @@ Private Sub EnsureFolderExists(ByVal folderPath As String)
     Set fileSystem = _
         CreateObject("Scripting.FileSystemObject")
 
-    If fileSystem.FolderExists(folderPath) Then Exit Sub
+
+    If fileSystem.FolderExists(folderPath) Then
+
+        Exit Sub
+
+    End If
+
 
     parentPath = _
         fileSystem.GetParentFolderName(folderPath)
 
+
     If Len(parentPath) > 0 Then
 
         If Not fileSystem.FolderExists(parentPath) Then
+
             EnsureFolderExists parentPath
+
         End If
 
     End If
+
 
     fileSystem.CreateFolder folderPath
 
 End Sub
 
+
 '============================================================
-' ファイルの存在確認
+' ファイルが存在するか確認
 '============================================================
 
 Private Function FileExists(ByVal filePath As String) As Boolean
 
     Dim fileSystem As Object
 
-    If Len(filePath) = 0 Then Exit Function
+    If Len(filePath) = 0 Then
+
+        FileExists = False
+
+        Exit Function
+
+    End If
+
 
     Set fileSystem = _
         CreateObject("Scripting.FileSystemObject")
+
 
     FileExists = _
         fileSystem.FileExists(filePath)
 
 End Function
 
+
 '============================================================
-' ファイル名として使用できない文字を除去・置換
+' ファイル名に使用できない文字を処理
 '============================================================
 
 Private Function CleanFileComponent( _
@@ -508,9 +545,14 @@ Private Function CleanFileComponent( _
     Dim characterCode As Long
     Dim cleanedText As String
 
+
     cleanedText = sourceText
 
-    ' 制御文字を空白に置換
+
+    '--------------------------------------------------------
+    ' 制御文字を空白へ置換
+    '--------------------------------------------------------
+
     For characterCode = 0 To 31
 
         cleanedText = _
@@ -521,9 +563,27 @@ Private Function CleanFileComponent( _
 
     Next characterCode
 
-    ' Windowsファイル名の禁則文字
+
+    '--------------------------------------------------------
+    ' Windowsのファイル名で使用できない文字
+    '
+    ' \ / : * ? " < > |
+    '
+    ' を「_」へ置換
+    '--------------------------------------------------------
+
     invalidCharacters = _
-        Array("\", "/", ":", "*", "?", """", "<", ">", "|")
+        Array( _
+            "\", _
+            "/", _
+            ":", _
+            "*", _
+            "?", _
+            """", _
+            "<", _
+            ">", _
+            "|")
+
 
     For Each invalidCharacter In invalidCharacters
 
@@ -535,9 +595,15 @@ Private Function CleanFileComponent( _
 
     Next invalidCharacter
 
+
+    ' 前後の空白を削除
     cleanedText = Trim$(cleanedText)
 
-    ' 連続する空白を1つにまとめる
+
+    '--------------------------------------------------------
+    ' 連続した空白を1文字へまとめる
+    '--------------------------------------------------------
+
     Do While InStr(cleanedText, "  ") > 0
 
         cleanedText = _
@@ -545,14 +611,25 @@ Private Function CleanFileComponent( _
 
     Loop
 
-    ' ファイル名末尾のピリオドと空白を削除
+
+    '--------------------------------------------------------
+    ' ファイル名末尾の
+    '
+    ' ・空白
+    ' ・ピリオド
+    '
+    ' を削除
+    '--------------------------------------------------------
+
     Do While Len(cleanedText) > 0
 
         If Right$(cleanedText, 1) = "." _
             Or Right$(cleanedText, 1) = " " Then
 
             cleanedText = _
-                Left$(cleanedText, Len(cleanedText) - 1)
+                Left$( _
+                    cleanedText, _
+                    Len(cleanedText) - 1)
 
         Else
 
@@ -562,16 +639,25 @@ Private Function CleanFileComponent( _
 
     Loop
 
+
+    '--------------------------------------------------------
+    ' 空文字になった場合
+    '--------------------------------------------------------
+
     If Len(cleanedText) = 0 Then
+
         cleanedText = fallbackText
+
     End If
+
 
     CleanFileComponent = cleanedText
 
 End Function
 
+
 '============================================================
-' パス全体が長くなりすぎないようにファイル名を短縮
+' パス全体が長くなりすぎないように調整
 '============================================================
 
 Private Function FitFileStemToPath( _
@@ -582,11 +668,13 @@ Private Function FitFileStemToPath( _
     Dim maximumStemLength As Long
     Dim adjustedStem As String
 
+
     maximumStemLength = _
         MAX_PATH_LENGTH _
         - Len(folderPath) _
         - 1 _
         - Len(extensionText)
+
 
     If maximumStemLength < 30 Then
 
@@ -597,23 +685,34 @@ Private Function FitFileStemToPath( _
 
     End If
 
+
     adjustedStem = fileStem
+
 
     If Len(adjustedStem) > maximumStemLength Then
 
         adjustedStem = _
-            Left$(adjustedStem, maximumStemLength)
+            Left$( _
+                adjustedStem, _
+                maximumStemLength)
 
     End If
 
-    ' 短縮後の末尾のピリオドと空白を削除
+
+    '--------------------------------------------------------
+    ' 短縮した結果、
+    ' 最後が空白またはピリオドなら削除
+    '--------------------------------------------------------
+
     Do While Len(adjustedStem) > 0
 
         If Right$(adjustedStem, 1) = "." _
             Or Right$(adjustedStem, 1) = " " Then
 
             adjustedStem = _
-                Left$(adjustedStem, Len(adjustedStem) - 1)
+                Left$( _
+                    adjustedStem, _
+                    Len(adjustedStem) - 1)
 
         Else
 
@@ -623,259 +722,20 @@ Private Function FitFileStemToPath( _
 
     Loop
 
+
     FitFileStemToPath = adjustedStem
 
 End Function
 
-'============================================================
-' 保存先パスをメール内に記録
-'============================================================
-
-Private Sub SetRegisteredSavePath( _
-    ByVal mail As Outlook.MailItem, _
-    ByVal savePath As String)
-
-    Dim userProperty As Outlook.UserProperty
-
-    Set userProperty = _
-        mail.UserProperties.Find( _
-            SAVE_PATH_PROPERTY, _
-            True)
-
-    If userProperty Is Nothing Then
-
-        Set userProperty = _
-            mail.UserProperties.Add( _
-                SAVE_PATH_PROPERTY, _
-                olText, _
-                False)
-
-    End If
-
-    userProperty.Value = savePath
-
-End Sub
 
 '============================================================
-' メール内に記録された保存先パスを取得
-'============================================================
-
-Private Function GetRegisteredSavePath( _
-    ByVal mail As Outlook.MailItem) As String
-
-    Dim userProperty As Outlook.UserProperty
-
-    Set userProperty = _
-        mail.UserProperties.Find( _
-            SAVE_PATH_PROPERTY, _
-            True)
-
-    If Not userProperty Is Nothing Then
-
-        GetRegisteredSavePath = _
-            CStr(userProperty.Value)
-
-    End If
-
-End Function
-
-'============================================================
-' メール内に記録された保存先パスを削除
-'============================================================
-
-Private Sub ClearRegisteredSavePath( _
-    ByVal mail As Outlook.MailItem)
-
-    Dim userProperty As Outlook.UserProperty
-
-    Set userProperty = _
-        mail.UserProperties.Find( _
-            SAVE_PATH_PROPERTY, _
-            True)
-
-    If Not userProperty Is Nothing Then
-        userProperty.Delete
-    End If
-
-End Sub
-
-'============================================================
-' Outlookの分類項目一覧に分類項目を作成
-'============================================================
-
-Private Sub EnsureMasterCategory(ByVal categoryName As String)
-
-    Dim outlookCategory As Outlook.Category
-
-    On Error Resume Next
-
-    Set outlookCategory = _
-        Application.Session.Categories.Item(categoryName)
-
-    If outlookCategory Is Nothing Then
-
-        Set outlookCategory = _
-            Application.Session.Categories.Add(categoryName)
-
-    End If
-
-    On Error GoTo 0
-
-End Sub
-
-'============================================================
-' 指定した分類項目が設定されているか確認
-'============================================================
-
-Private Function HasCategory( _
-    ByVal categoryText As String, _
-    ByVal categoryName As String) As Boolean
-
-    Dim separatorText As String
-    Dim categoryArray As Variant
-    Dim categoryValue As Variant
-
-    If Len(Trim$(categoryText)) = 0 Then Exit Function
-
-    separatorText = GetCategorySeparator()
-    categoryArray = Split(categoryText, separatorText)
-
-    For Each categoryValue In categoryArray
-
-        If StrComp( _
-            Trim$(CStr(categoryValue)), _
-            categoryName, _
-            vbTextCompare) = 0 Then
-
-            HasCategory = True
-            Exit Function
-
-        End If
-
-    Next categoryValue
-
-End Function
-
-'============================================================
-' 分類項目を追加
+' エラーログ
 '
-' 既存の分類項目は残す。
-'============================================================
-
-Private Function AddCategoryIfMissing( _
-    ByVal mail As Outlook.MailItem, _
-    ByVal categoryName As String) As Boolean
-
-    Dim separatorText As String
-
-    If HasCategory(mail.Categories, categoryName) Then
-        Exit Function
-    End If
-
-    separatorText = GetCategorySeparator()
-
-    If Len(Trim$(mail.Categories)) = 0 Then
-
-        mail.Categories = categoryName
-
-    Else
-
-        mail.Categories = _
-            mail.Categories & _
-            separatorText & _
-            categoryName
-
-    End If
-
-    AddCategoryIfMissing = True
-
-End Function
-
-'============================================================
-' 指定した分類項目を削除
+' 保存場所：
 '
-' その他の分類項目は残す。
-'============================================================
-
-Private Sub RemoveCategoryIfPresent( _
-    ByVal mail As Outlook.MailItem, _
-    ByVal categoryName As String)
-
-    Dim separatorText As String
-    Dim categoryArray As Variant
-    Dim categoryValue As Variant
-
-    Dim rebuiltCategories As String
-    Dim currentCategory As String
-
-    If Len(Trim$(mail.Categories)) = 0 Then Exit Sub
-
-    separatorText = GetCategorySeparator()
-    categoryArray = Split(mail.Categories, separatorText)
-
-    For Each categoryValue In categoryArray
-
-        currentCategory = Trim$(CStr(categoryValue))
-
-        If Len(currentCategory) > 0 Then
-
-            If StrComp( _
-                currentCategory, _
-                categoryName, _
-                vbTextCompare) <> 0 Then
-
-                If Len(rebuiltCategories) > 0 Then
-
-                    rebuiltCategories = _
-                        rebuiltCategories & separatorText
-
-                End If
-
-                rebuiltCategories = _
-                    rebuiltCategories & currentCategory
-
-            End If
-
-        End If
-
-    Next categoryValue
-
-    mail.Categories = rebuiltCategories
-
-End Sub
-
-'============================================================
-' Windowsのリスト区切り文字を取得
-'============================================================
-
-Private Function GetCategorySeparator() As String
-
-    Dim registryShell As Object
-    Dim separatorText As String
-
-    On Error Resume Next
-
-    Set registryShell = CreateObject("WScript.Shell")
-
-    separatorText = _
-        CStr(registryShell.RegRead( _
-            "HKCU\Control Panel\International\sList"))
-
-    On Error GoTo 0
-
-    If Len(separatorText) = 0 Then
-        separatorText = ","
-    End If
-
-    GetCategorySeparator = separatorText
-
-End Function
-
-'============================================================
-' エラーログを出力
-'
-' 保存先：
-' Documents\受信メール\保存エラー.log
+' Documents
+' └ 受信メール
+'    └ 保存エラー.log
 '============================================================
 
 Private Sub WriteErrorLog( _
@@ -887,26 +747,36 @@ Private Sub WriteErrorLog( _
 
     Dim logFolderPath As String
     Dim logFilePath As String
+
     Dim fileNumber As Integer
 
     Dim mailSubject As String
     Dim mailEntryID As String
     Dim senderName As String
 
+
     On Error Resume Next
+
 
     logFolderPath = GetSaveFolderPath()
 
     EnsureFolderExists logFolderPath
 
+
     logFilePath = _
         logFolderPath & "\保存エラー.log"
 
+
     If Not mail Is Nothing Then
 
-        mailSubject = CleanLogText(mail.Subject)
-        mailEntryID = CleanLogText(mail.EntryID)
-        senderName = CleanLogText(mail.SenderName)
+        mailSubject = _
+            CleanLogText(mail.Subject)
+
+        mailEntryID = _
+            CleanLogText(mail.EntryID)
+
+        senderName = _
+            CleanLogText(mail.SenderName)
 
     Else
 
@@ -916,9 +786,12 @@ Private Sub WriteErrorLog( _
 
     End If
 
+
     fileNumber = FreeFile
 
+
     Open logFilePath For Append As #fileNumber
+
 
     Print #fileNumber, _
         Format$(Now, "yyyy/mm/dd hh:nn:ss") & vbTab & _
@@ -930,17 +803,25 @@ Private Sub WriteErrorLog( _
         "保存先=" & CleanLogText(savePath) & vbTab & _
         "EntryID=" & mailEntryID
 
+
     Close #fileNumber
+
 
     On Error GoTo 0
 
 End Sub
 
+
 '============================================================
-' 同名ファイルのため保存をスキップした履歴を出力
+' 重複スキップログ
 '
-' 保存先：
-' Documents\受信メール\重複スキップ.log
+' 同じファイル名のMSGがすでに存在していた場合に記録。
+'
+' 保存場所：
+'
+' Documents
+' └ 受信メール
+'    └ 重複スキップ.log
 '============================================================
 
 Private Sub WriteDuplicateLog( _
@@ -949,39 +830,49 @@ Private Sub WriteDuplicateLog( _
 
     Dim logFolderPath As String
     Dim logFilePath As String
+
     Dim fileNumber As Integer
 
+
     On Error Resume Next
+
 
     logFolderPath = GetSaveFolderPath()
 
     EnsureFolderExists logFolderPath
 
+
     logFilePath = _
         logFolderPath & "\重複スキップ.log"
 
+
     fileNumber = FreeFile
 
+
     Open logFilePath For Append As #fileNumber
+
 
     Print #fileNumber, _
         Format$(Now, "yyyy/mm/dd hh:nn:ss") & vbTab & _
         "同名ファイルのためMSG保存をスキップ" & vbTab & _
         "受信日時=" & _
-            Format$(mail.ReceivedTime, "yyyy/mm/dd hh:nn:ss") & vbTab & _
+        Format$(mail.ReceivedTime, "yyyy/mm/dd hh:nn:ss") & vbTab & _
         "差出人=" & CleanLogText(mail.SenderName) & vbTab & _
         "件名=" & CleanLogText(mail.Subject) & vbTab & _
         "既存ファイル=" & CleanLogText(existingFilePath) & vbTab & _
         "EntryID=" & CleanLogText(mail.EntryID)
 
+
     Close #fileNumber
+
 
     On Error GoTo 0
 
 End Sub
 
+
 '============================================================
-' ログ内に改行やタブが入らないようにする
+' ログ用文字列から改行・タブを削除
 '============================================================
 
 Private Function CleanLogText( _
@@ -989,11 +880,19 @@ Private Function CleanLogText( _
 
     Dim cleanedText As String
 
+
     cleanedText = sourceText
 
-    cleanedText = Replace(cleanedText, vbCr, " ")
-    cleanedText = Replace(cleanedText, vbLf, " ")
-    cleanedText = Replace(cleanedText, vbTab, " ")
+
+    cleanedText = _
+        Replace(cleanedText, vbCr, " ")
+
+    cleanedText = _
+        Replace(cleanedText, vbLf, " ")
+
+    cleanedText = _
+        Replace(cleanedText, vbTab, " ")
+
 
     CleanLogText = cleanedText
 
