@@ -1,104 +1,24 @@
-Option Explicit
-
 '============================================================
-' 共有メールボックスの1フォルダを監視するクラス
-'============================================================
-
-Private WithEvents mItems As Outlook.Items
-Private WithEvents mFolders As Outlook.Folders
-
-Private mTargetFolder As Outlook.Folder
-
-Private mMode As Long
-
-Private mOwner As Object
-
-
-'============================================================
-' 初期化
+' 「.共有メールボックス」を削除
+'
+' 例：
+' 山田太郎.共有メールボックス
+' → 山田太郎
 '============================================================
 
-Public Sub Initialize( _
-    ByVal targetFolder As Outlook.Folder, _
-    ByVal mode As Long, _
-    ByVal owner As Object _
-)
+Private Function RemoveSharedMailboxText( _
+    ByVal text As String _
+) As String
 
-    Set mTargetFolder = targetFolder
+    text = Replace( _
+        text, _
+        ".共有メールボックス", _
+        "", _
+        1, _
+        -1, _
+        vbTextCompare _
+    )
 
-    Set mItems = _
-        targetFolder.Items
+    RemoveSharedMailboxText = Trim(text)
 
-    Set mFolders = _
-        targetFolder.Folders
-
-    mMode = mode
-
-    Set mOwner = owner
-
-End Sub
-
-
-'============================================================
-' このフォルダにアイテムが追加された
-'============================================================
-
-Private Sub mItems_ItemAdd( _
-    ByVal Item As Object _
-)
-
-    On Error GoTo ErrHandler
-
-    If mOwner Is Nothing Then
-        Exit Sub
-    End If
-
-    mOwner.HandleSharedFolderItem _
-        Item, _
-        mMode
-
-    Exit Sub
-
-
-ErrHandler:
-
-    Debug.Print _
-        "CSharedFolderWatcher ItemAdd Error " & _
-        Err.Number & " : " & _
-        Err.Description
-
-End Sub
-
-
-'============================================================
-' このフォルダの下に新しいサブフォルダが追加された
-'============================================================
-
-Private Sub mFolders_FolderAdd( _
-    ByVal Folder As Outlook.Folder _
-)
-
-    On Error GoTo ErrHandler
-
-    If mOwner Is Nothing Then
-        Exit Sub
-    End If
-
-    ' 新しいフォルダ自身＋その下位フォルダを監視
-    ' すでにメールが入っていれば同時に保存
-    mOwner.RegisterSharedFolderTree _
-        Folder, _
-        mMode, _
-        True
-
-    Exit Sub
-
-
-ErrHandler:
-
-    Debug.Print _
-        "CSharedFolderWatcher FolderAdd Error " & _
-        Err.Number & " : " & _
-        Err.Description
-
-End Sub
+End Function
