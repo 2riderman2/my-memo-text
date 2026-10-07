@@ -1,11 +1,1 @@
-{
-  "elmType": "div",
-  "txtContent": "=if(@group.count == 1, '予約なし', '')",
-  "style": {
-    "display": "=if(@group.count == 1, 'block', 'none')",
-    "font-size": "14px",
-    "color": "#605e5c",
-    "padding": "10px 0",
-    "text-align": "center"
-  }
-}
+https://xxxxx.sharepoint.com/sites/〇〇/_api/web/lists/getbytitle('ライブラリ名')/items?$select=Id,FileLeafRef,FileRef,File_x0020_Size&$filter=FSObjType eq 0 and File_x0020_Size ge 104857600&$top=10
