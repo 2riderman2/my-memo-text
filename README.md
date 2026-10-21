@@ -1,234 +1,203 @@
 
 (async () => {
-  // SharePoint全ファイル一覧取得 v2
-  // 11ライブラリ対応・権限不足スキップ・更新者取得
-  // 読み取り専用 / IndexedDBで進捗保存
+  "use strict";
 
-  const match = location.pathname.match(/^\/sites\/([^/]+)/i);
-  if (!match) {
-    console.error("/sites/〇〇 のSharePointサイトで実行してください");
+  // PDF旧バージョン削除
+  // ①の調査CSVにある「削除候補」のみ対象
+
+  const match = location.pathname.match(
+    /^\/(sites|teams)\/([^/]+)/i
+  );
+
+  if (!match || !location.hostname.endsWith(".sharepoint.com")) {
+    alert("対象のSharePointサイトで実行してください");
     return;
   }
 
-  const site = location.origin + "/sites/" + match[1];
-  const databaseName = "SP_FILE_EXPORT_V2_" + site;
-  const pageSize = 100;
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const site =
+    `${location.origin}/${match[1]}/${match[2]}`;
 
-  // -------- REST API --------
+  const sitePath =
+    new URL(site).pathname.toLowerCase() + "/";
 
-  async function getJson(url) {
-    for (let attempt = 1; attempt <= 7; attempt++) {
-      try {
-        const res = await fetch(url, {
-          method: "GET",
-          credentials: "same-origin",
-          headers: {
-            Accept: "application/json;odata=verbose"
-          }
-        });
+  const DAYS = 100;
 
-        if (res.ok) return await res.json();
+  const sleep = ms =>
+    new Promise(r => setTimeout(r, ms));
 
-        if (![429, 500, 502, 503, 504].includes(res.status)) {
-          const err = new Error("HTTP " + res.status);
-          err.status = res.status;
-          throw err;
+  const headers = {
+    Accept: "application/json;odata=verbose"
+  };
+
+  function escapeLiteral(value) {
+    return encodeURIComponent(
+      value.replace(/'/g, "''")
+    ).replace(/'/g, "%27");
+  }
+
+  function fileApi(path) {
+    return (
+      site +
+      "/_api/web/GetFileByServerRelativePath(decodedurl='" +
+      escapeLiteral(path) +
+      "')"
+    );
+  }
+
+  // ---------- 操作パネル ----------
+
+  document.getElementById("sp-pdf-version-tool")?.remove();
+
+  const panel = document.createElement("section");
+  panel.id = "sp-pdf-version-tool";
+
+  panel.style.cssText = [
+    "position:fixed",
+    "z-index:2147483647",
+    "top:16px",
+    "right:16px",
+    "width:min(560px,92vw)",
+    "max-height:90vh",
+    "overflow:auto",
+    "background:#fff",
+    "color:#111",
+    "border:2px solid #b32929",
+    "border-radius:12px",
+    "padding:17px",
+    "box-shadow:0 5px 28px #0006",
+    "font:14px/1.5 sans-serif"
+  ].join(";");
+
+  panel.innerHTML = `
+    <strong style="font-size:17px">
+      PDF旧バージョン削除
+    </strong>
+    <p>
+      確認済みの削除候補CSVを選択してください。
+    </p>
+    <input id="sp-delete-file"
+           type="file"
+           accept=".csv,text/csv"
+           style="width:100%">
+    <p id="sp-delete-status">実行待ち</p>
+    <button id="sp-delete-run">
+      対象を確認して削除開始
+    </button>
+    <button id="sp-delete-stop" disabled>
+      次の削除前に停止
+    </button>
+    <button id="sp-delete-log" disabled>
+      結果CSVを保存
+    </button>
+    <p style="font-size:12px">
+      削除は元に戻せない場合があります。
+      保持ポリシーや権限によって失敗する場合があります。
+    </p>
+  `;
+
+  document.body.appendChild(panel);
+
+  const ui = {
+    file: panel.querySelector("#sp-delete-file"),
+    run: panel.querySelector("#sp-delete-run"),
+    stop: panel.querySelector("#sp-delete-stop"),
+    log: panel.querySelector("#sp-delete-log"),
+    status: panel.querySelector("#sp-delete-status")
+  };
+
+  function setStatus(message) {
+    ui.status.textContent = message;
+    console.log(message);
+  }
+
+  let shouldStop = false;
+  const results = [];
+
+  const resultHeader = [
+    "結果",
+    "ライブラリ名",
+    "ファイル名",
+    "ファイルパス",
+    "バージョンID",
+    "バージョン番号",
+    "バージョン作成日時UTC",
+    "詳細"
+  ];
+
+  // ---------- CSV ----------
+
+  function parseCSV(text) {
+    text = text.replace(/^\uFEFF/, "");
+
+    const rows = [];
+    let row = [];
+    let field = "";
+    let quoted = false;
+
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+
+      if (quoted) {
+        if (c === '"' && text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else if (c === '"') {
+          quoted = false;
+        } else {
+          field += c;
+        }
+      } else if (c === '"') {
+        quoted = true;
+      } else if (c === ",") {
+        row.push(field);
+        field = "";
+      } else if (c === "\r" || c === "\n") {
+        if (c === "\r" && text[i + 1] === "\n") i++;
+
+        row.push(field);
+        field = "";
+
+        if (row.some(x => x !== "")) {
+          rows.push(row);
         }
 
-        if (attempt === 7) {
-          throw new Error("HTTP " + res.status + " 再試行上限");
-        }
-
-        const retry = Number(res.headers.get("Retry-After"));
-        const wait = retry > 0
-          ? retry * 1000
-          : Math.min(2000 * 2 ** (attempt - 1), 60000);
-
-        console.warn(
-          `HTTP ${res.status}：${Math.ceil(wait / 1000)}秒後に再試行`
-        );
-        await sleep(wait);
-
-      } catch (e) {
-        if (e.status || attempt === 7 ||
-            /再試行上限/.test(e.message)) throw e;
-
-        await sleep(Math.min(2000 * 2 ** (attempt - 1), 60000));
+        row = [];
+      } else {
+        field += c;
       }
     }
-  }
 
-  function nextPage(value) {
-    if (!value) return null;
-
-    const u = new URL(value, site);
-    if (u.hostname !== location.hostname) {
-      throw new Error("ページ送り先のホストが異なります");
+    if (quoted) {
+      throw new Error("CSVの引用符が閉じられていません");
     }
 
-    u.protocol = location.protocol;
-
-    if (
-      u.origin !== location.origin ||
-      !u.pathname.startsWith(
-        new URL(site).pathname + "/_api/"
-      )
-    ) {
-      throw new Error("想定外のページ送りURLです");
+    if (field || row.length) {
+      row.push(field);
+      rows.push(row);
     }
 
-    return u.href;
-  }
-
-  // -------- IndexedDB --------
-
-  function openDatabase() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open(databaseName, 1);
-
-      req.onupgradeneeded = () => {
-        const db = req.result;
-        db.createObjectStore("records", {keyPath: "key"});
-        db.createObjectStore("states", {keyPath: "id"});
-      };
-
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-
-  function readState(db, id) {
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("states", "readonly");
-      const req = tx.objectStore("states").get(id);
-      req.onsuccess = () => resolve(req.result || null);
-      req.onerror = () => reject(req.error);
-    });
-  }
-
-  function savePage(db, records, state) {
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(
-        ["records", "states"], "readwrite"
-      );
-
-      const store = tx.objectStore("records");
-
-      for (const record of records) store.put(record);
-      tx.objectStore("states").put(state);
-
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error);
-    });
-  }
-
-  // -------- 日時・CSV --------
-
-  function japanTime(value) {
-    if (!value) return "";
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return "";
-
-    return new Intl.DateTimeFormat("ja-JP", {
-      timeZone: "Asia/Tokyo",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hourCycle: "h23"
-    }).format(date);
+    return rows;
   }
 
   function csvCell(value) {
     let s = String(value ?? "");
 
-    // Excelの数式として解釈されることを防ぐ
-    if (/^\s*[=+\-@]/.test(s)) s = "'" + s;
+    if (/^\s*[=+@\-]/.test(s)) {
+      s = "'" + s;
+    }
 
     return '"' + s.replace(/"/g, '""') + '"';
   }
 
-  async function exportCsv(db, completedIds) {
-    const header = [
-      "ライブラリ名",
-      "ファイルID",
-      "ファイル名",
-      "拡張子",
-      "サイズ_バイト",
-      "サイズ_MiB",
-      "ファイルパス",
-      "最終更新日時",
-      "最終更新者"
-    ];
+  function downloadLog() {
+    const csv =
+      "\uFEFF" +
+      [resultHeader, ...results]
+        .map(row => row.map(csvCell).join(","))
+        .join("\r\n") +
+      "\r\n";
 
-    const chunks = [
-      "\uFEFF",
-      header.map(csvCell).join(",") + "\r\n"
-    ];
-
-    let lines = [];
-    let count = 0;
-
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction("records", "readonly");
-      const req = tx.objectStore("records").openCursor();
-
-      req.onsuccess = () => {
-        const cursor = req.result;
-
-        if (!cursor) {
-          if (lines.length) {
-            chunks.push(lines.join("\r\n") + "\r\n");
-          }
-          resolve();
-          return;
-        }
-
-        const r = cursor.value;
-
-        if (completedIds.has(r.libraryId)) {
-          const dot = r.name.lastIndexOf(".");
-          const ext = dot > 0
-            ? r.name.slice(dot + 1).toLowerCase()
-            : "";
-
-          const mib = r.size == null
-            ? ""
-            : (Number(r.size) / 1048576).toFixed(2);
-
-          const values = [
-            r.library,
-            r.itemId,
-            r.name,
-            ext,
-            r.size ?? "",
-            mib,
-            r.path,
-            japanTime(r.modified),
-            r.editor
-          ];
-
-          lines.push(values.map(csvCell).join(","));
-          count++;
-
-          if (lines.length >= 5000) {
-            chunks.push(lines.join("\r\n") + "\r\n");
-            lines = [];
-          }
-        }
-
-        cursor.continue();
-      };
-
-      req.onerror = () => reject(req.error);
-      tx.onerror = () => reject(tx.error);
-    });
-
-    const blob = new Blob(chunks, {
+    const blob = new Blob([csv], {
       type: "text/csv;charset=utf-8"
     });
 
@@ -236,275 +205,523 @@
     const a = document.createElement("a");
 
     a.href = url;
-    a.download = "SharePoint_全ファイル一覧.csv";
+    a.download = "SharePoint_PDF旧バージョン削除結果.csv";
+
     document.body.appendChild(a);
     a.click();
     a.remove();
 
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
-
-    console.log("CSV出力開始:", count, "ファイル");
+    setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 60000);
   }
 
-  // -------- メイン処理 --------
+  ui.log.onclick = downloadLog;
 
-  let db;
+  ui.stop.onclick = () => {
+    shouldStop = true;
+    ui.stop.disabled = true;
 
-  try {
-    console.log("SharePointライブラリ一覧を取得中...");
+    setStatus(
+      "停止要求を受け付けました。現在の通信後に停止します。"
+    );
+  };
 
-    let listUrl = site +
-      "/_api/web/lists?" +
-      new URLSearchParams({
-        "$select": "Id,Title,BaseTemplate,ItemCount",
-        "$top": "100"
-      });
+  // ---------- REST GET ----------
 
-    const libraries = [];
+  async function apiGet(url) {
+    for (let attempt = 0; attempt < 7; attempt++) {
+      let response;
 
-    while (listUrl) {
-      const data = await getJson(listUrl);
-      libraries.push(
-        ...data.d.results.filter(x => x.BaseTemplate === 101)
+      try {
+        response = await fetch(url, {
+          method: "GET",
+          credentials: "same-origin",
+          headers
+        });
+      } catch (error) {
+        if (attempt === 6) throw error;
+
+        await sleep(
+          Math.min(1500 * 2 ** attempt, 60000)
+        );
+        continue;
+      }
+
+      if (response.ok) {
+        return response.json();
+      }
+
+      const message =
+        (await response.text()).slice(0, 150);
+
+      if (
+        ![429, 500, 502, 503, 504].includes(response.status) ||
+        attempt === 6
+      ) {
+        const error = new Error(
+          `HTTP ${response.status}: ${message}`
+        );
+
+        error.status = response.status;
+        throw error;
+      }
+
+      const retry = Number(
+        response.headers.get("Retry-After")
       );
-      listUrl = nextPage(data.d.__next);
+
+      await sleep(
+        Number.isFinite(retry) && retry > 0
+          ? retry * 1000
+          : Math.min(1500 * 2 ** attempt, 60000)
+      );
+    }
+  }
+
+  function nextPage(value) {
+    if (!value) return null;
+
+    const url = new URL(value, site);
+
+    if (
+      url.origin !== location.origin ||
+      !url.pathname.toLowerCase().startsWith(
+        sitePath + "_api/"
+      )
+    ) {
+      throw new Error("ページ送り先が不正です");
     }
 
-    libraries.sort((a, b) =>
-      a.Title.localeCompare(b.Title, "ja")
+    return url.href;
+  }
+
+  async function getVersions(base) {
+    const all = [];
+    let url = base + "/Versions?$top=200";
+    let pages = 0;
+
+    while (url) {
+      pages++;
+
+      if (pages > 200) {
+        throw new Error(
+          "バージョン履歴のページ上限を超えました"
+        );
+      }
+
+      const data = await apiGet(url);
+
+      if (!Array.isArray(data?.d?.results)) {
+        throw new Error(
+          "バージョン履歴の形式が不正です"
+        );
+      }
+
+      all.push(...data.d.results);
+      url = nextPage(data.d.__next);
+    }
+
+    return all;
+  }
+
+  // ---------- 削除用ダイジェスト ----------
+
+  let digest = "";
+  let digestExpiry = 0;
+
+  async function ensureDigest() {
+    if (digest && Date.now() < digestExpiry) {
+      return digest;
+    }
+
+    const response = await fetch(
+      site + "/_api/contextinfo",
+      {
+        method: "POST",
+        credentials: "same-origin",
+        headers
+      }
     );
 
-    console.table(libraries.map((x, i) => ({
-      番号: i + 1,
-      ライブラリ名: x.Title,
-      登録アイテム数: x.ItemCount
-    })));
+    if (!response.ok) {
+      throw new Error(
+        "認証ダイジェスト取得失敗 HTTP " +
+        response.status
+      );
+    }
 
-    const choiceText = libraries.map((x, i) =>
-      `${i + 1}: ${x.Title}`
-    ).join("\n");
+    const data = await response.json();
 
-    const answer = prompt(
-      "取得するライブラリ番号を入力\n" +
-      "全部なら ALL\n" +
-      "一部なら 1,2,3 の形式\n\n" +
-      choiceText
-    );
+    const info =
+      data?.d?.GetContextWebInformation;
 
-    if (answer === null || !answer.trim()) {
-      console.log("キャンセルしました");
+    if (!info?.FormDigestValue) {
+      throw new Error(
+        "認証ダイジェストの形式が不正です"
+      );
+    }
+
+    digest = info.FormDigestValue;
+
+    digestExpiry =
+      Date.now() +
+      Math.max(
+        60,
+        Number(info.FormDigestTimeoutSeconds || 1800) - 120
+      ) * 1000;
+
+    return digest;
+  }
+
+  // ---------- バージョン削除 ----------
+
+  async function deleteVersion(base, id) {
+    const url =
+      base + `/Versions/deleteByID(${id})`;
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const d = await ensureDigest();
+
+      let response;
+
+      try {
+        response = await fetch(url, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            Accept: "application/json;odata=verbose",
+            "X-RequestDigest": d
+          }
+        });
+
+      } catch (error) {
+        throw new Error(
+          "通信結果が不明です。再実行前に状態確認：" +
+          error.message
+        );
+      }
+
+      if (response.ok) {
+        return;
+      }
+
+      if (
+        response.status === 403 &&
+        attempt === 0
+      ) {
+        digest = "";
+
+      } else if (
+        response.status !== 429 ||
+        attempt === 4
+      ) {
+        throw new Error(
+          `HTTP ${response.status}: ` +
+          (await response.text()).slice(0, 150)
+        );
+      }
+
+      const retry = Number(
+        response.headers.get("Retry-After")
+      );
+
+      await sleep(
+        Number.isFinite(retry) && retry > 0
+          ? retry * 1000
+          : Math.min(2000 * 2 ** attempt, 60000)
+      );
+    }
+  }
+
+  // ---------- 削除開始 ----------
+
+  ui.run.onclick = async () => {
+    if (!ui.file.files.length) {
+      alert("調査結果CSVを選択してください");
       return;
     }
 
-    let selected;
+    ui.run.disabled = true;
 
-    if (answer.trim().toUpperCase() === "ALL") {
-      selected = libraries;
-    } else {
-      const numbers = [...new Set(
-        answer.trim().split(/[,，、\s]+/).map(Number)
-      )];
+    try {
+      const text = await ui.file.files[0].text();
+      const data = parseCSV(text);
+      const header = data.shift();
 
-      if (numbers.some(n =>
-        !Number.isInteger(n) || n < 1 || n > libraries.length
-      )) {
-        throw new Error("選択番号が正しくありません");
+      const ix = name => header.indexOf(name);
+
+      const required = [
+        "状態",
+        "ライブラリ名",
+        "ファイル名",
+        "ファイルパス",
+        "バージョンID",
+        "バージョン番号",
+        "バージョン作成日時UTC"
+      ];
+
+      if (required.some(x => ix(x) < 0)) {
+        throw new Error(
+          "調査用スクリプトのCSVではありません"
+        );
       }
 
-      selected = numbers.map(n => libraries[n - 1]);
-    }
+      const selected = new Map();
 
-    db = await openDatabase();
-
-    const statuses = [];
-    const completedIds = new Set();
-
-    for (const lib of selected) {
-      console.log("処理開始:", lib.Title);
-
-      const listApi = site +
-        "/_api/web/lists(guid'" + lib.Id + "')";
-
-      try {
-        // ライブラリへのアクセスを確認
-        await getJson(listApi + "?$select=Id");
-
-        let state = await readState(db, lib.Id);
-
-        if (state?.done) {
-          console.log("保存済み:", lib.Title);
-          completedIds.add(lib.Id);
-
-          statuses.push({
-            ライブラリ: lib.Title,
-            状態: "取得済み",
-            ファイル数: state.files,
-            詳細: "保存データを利用"
-          });
+      for (const row of data) {
+        if (row[ix("状態")] !== "削除候補") {
           continue;
         }
 
-        const params = new URLSearchParams({
-          "$select": [
-            "Id",
-            "FileLeafRef",
-            "FileRef",
-            "FSObjType",
-            "Modified",
-            "File/Length",
-            "Editor/Title"
-          ].join(","),
-          "$expand": "File,Editor",
-          "$orderby": "Id asc",
-          "$top": String(pageSize)
+        const path = row[ix("ファイルパス")];
+        const id = Number(row[ix("バージョンID")]);
+        const name = row[ix("ファイル名")];
+
+        const created =
+          row[ix("バージョン作成日時UTC")];
+
+        if (
+          !path?.toLowerCase().startsWith(sitePath) ||
+          !/\.pdf$/i.test(path) ||
+          !/\.pdf$/i.test(name) ||
+          !Number.isSafeInteger(id) ||
+          id <= 0 ||
+          !Number.isFinite(Date.parse(created))
+        ) {
+          throw new Error(
+            "不正なファイルパスまたはバージョン指定です"
+          );
+        }
+
+        selected.set(path + "|" + id, {
+          library: row[ix("ライブラリ名")],
+          name,
+          path,
+          id,
+          label: row[ix("バージョン番号")],
+          created
         });
+      }
 
-        let url = state?.nextUrl ||
-          listApi + "/items?" + params.toString();
+      const targets = [...selected.values()];
 
-        let pages = state?.pages || 0;
-        let seen = state?.seen || 0;
-        let files = state?.files || 0;
-        let missingSizes = state?.missingSizes || 0;
+      if (!targets.length) {
+        throw new Error("削除候補がありません");
+      }
 
-        while (url) {
-          const data = await getJson(url);
-          const items = data?.d?.results;
+      const libraries = [
+        ...new Set(targets.map(x => x.library))
+      ];
 
-          if (!Array.isArray(items)) {
-            throw new Error("想定外のAPIレスポンス");
-          }
+      const confirmation = prompt(
+        `削除対象：${targets.length}バージョン\n` +
+        `対象ライブラリ：${libraries.length}件\n\n` +
+        "最新版は残し、100日以上前の旧バージョンのみ削除します。\n" +
+        "保存義務と削除権限を確認してください。\n\n" +
+        "実行する場合のみ「削除実行」と入力してください。"
+      );
 
-          const records = [];
+      if (confirmation !== "削除実行") {
+        setStatus("削除をキャンセルしました");
+        return;
+      }
 
-          for (const item of items) {
-            if (Number(item.FSObjType) !== 0) continue;
+      shouldStop = false;
+      ui.stop.disabled = false;
+      ui.log.disabled = false;
 
-            const size = item.File?.Length ?? null;
+      let done = 0;
+      let success = 0;
+      let skipped = 0;
+      let failed = 0;
 
-            if (size === null) missingSizes++;
+      const grouped = new Map();
 
-            records.push({
-              key: lib.Id + "|" + item.Id,
-              libraryId: lib.Id,
-              library: lib.Title,
-              itemId: item.Id,
-              name: item.FileLeafRef || "",
-              size,
-              path: item.FileRef || "",
-              modified: item.Modified || "",
-              editor: item.Editor?.Title || ""
-            });
-          }
+      for (const target of targets) {
+        if (!grouped.has(target.path)) {
+          grouped.set(target.path, []);
+        }
 
-          const following = nextPage(data.d.__next);
+        grouped.get(target.path).push(target);
+      }
 
-          pages++;
-          seen += items.length;
-          files += records.length;
+      const cutoff =
+        Date.now() - DAYS * 86400000;
 
-          state = {
-            id: lib.Id,
-            nextUrl: following,
-            pages,
-            seen,
-            files,
-            missingSizes,
-            done: !following
-          };
+      for (const [path, items] of grouped) {
+        if (shouldStop) break;
 
-          await savePage(db, records, state);
-          url = following;
+        const base = fileApi(path);
 
-          if (pages % 10 === 0 || !url) {
-            console.log(
-              `${lib.Title}: ${seen.toLocaleString()}件確認 / ` +
-              `${files.toLocaleString()}ファイル`
+        try {
+          // 最新版と旧バージョンを再確認
+
+          const current = await apiGet(
+            base + "?$select=UIVersionLabel"
+          );
+
+          const currentLabel = String(
+            current?.d?.UIVersionLabel || ""
+          );
+
+          if (!currentLabel) {
+            throw new Error(
+              "最新版のバージョン番号を確認できません"
             );
           }
 
-          if (pages > 50000) {
-            throw new Error("ページ数が安全上限を超えました");
+          const versions = await getVersions(base);
+
+          for (const target of items) {
+            if (shouldStop) break;
+
+            let status = "見送り";
+            let detail = "";
+
+            try {
+              const version = versions.find(
+                x => Number(x.ID ?? x.Id) === target.id
+              );
+
+              if (!version) {
+                detail =
+                  "既に存在しない、または履歴に見つからない";
+
+              } else if (
+                version.IsCurrentVersion === true ||
+                String(version.VersionLabel) === currentLabel
+              ) {
+                detail =
+                  "最新版の可能性があるため除外";
+
+              } else if (
+                String(version.VersionLabel) !==
+                String(target.label)
+              ) {
+                detail =
+                  "バージョン番号が調査時と不一致";
+
+              } else if (
+                Date.parse(version.Created) !==
+                Date.parse(target.created)
+              ) {
+                detail =
+                  "作成日時が調査時と不一致";
+
+              } else if (
+                !Number.isFinite(
+                  Date.parse(version.Created)
+                ) ||
+                Date.parse(version.Created) > cutoff
+              ) {
+                detail =
+                  "100日以上前という条件に合わない";
+
+              } else {
+                await deleteVersion(
+                  base,
+                  target.id
+                );
+
+                status = "削除要求成功";
+                detail =
+                  "SharePointが削除要求を受理";
+              }
+
+            } catch (error) {
+              status = "削除失敗";
+              detail = error.message;
+            }
+
+            if (status === "削除要求成功") {
+              success++;
+            } else if (status === "削除失敗") {
+              failed++;
+            } else {
+              skipped++;
+            }
+
+            results.push([
+              status,
+              target.library,
+              target.name,
+              target.path,
+              target.id,
+              target.label,
+              target.created,
+              detail
+            ]);
+
+            done++;
+
+            if (
+              done % 10 === 0 ||
+              done === targets.length
+            ) {
+              setStatus(
+                `処理 ${done}/${targets.length} / ` +
+                `削除要求成功 ${success} / ` +
+                `見送り ${skipped} / ` +
+                `失敗 ${failed}`
+              );
+            }
+
+            await sleep(250);
           }
 
-          await sleep(300);
+        } catch (error) {
+          for (const target of items) {
+            if (shouldStop) break;
+
+            results.push([
+              "削除失敗",
+              target.library,
+              target.name,
+              target.path,
+              target.id,
+              target.label,
+              target.created,
+              "取得・照合失敗：" + error.message
+            ]);
+
+            failed++;
+            done++;
+          }
+
+          console.warn(
+            "ファイル単位の処理失敗:",
+            path,
+            error.message
+          );
         }
+      }
 
-        completedIds.add(lib.Id);
+      setStatus(
+        `終了：${done}/${targets.length}件 / ` +
+        `削除要求成功 ${success} / ` +
+        `見送り ${skipped} / ` +
+        `失敗 ${failed}` +
+        (shouldStop ? "（途中停止）" : "")
+      );
 
-        statuses.push({
-          ライブラリ: lib.Title,
-          状態: "成功",
-          ファイル数: files,
-          詳細: missingSizes
-            ? `サイズ未取得 ${missingSizes}件`
-            : "正常終了"
-        });
+      downloadLog();
 
-      } catch (err) {
-        // 権限不足でも、ほかのライブラリへ進む
-        const denied = [401, 403, 404].includes(err.status);
+    } catch (error) {
+      console.error(error);
+      setStatus("処理停止：" + error.message);
 
-        statuses.push({
-          ライブラリ: lib.Title,
-          状態: denied ? "スキップ" : "取得失敗",
-          ファイル数: "未確定",
-          詳細: denied
-            ? `アクセス不可または未検出 HTTP ${err.status}`
-            : err.message
-        });
+    } finally {
+      ui.run.disabled = false;
+      ui.stop.disabled = true;
 
-        console.warn(
-          `${lib.Title}: ${denied ? "スキップ" : "取得失敗"}`,
-          err.message
-        );
+      if (results.length) {
+        ui.log.disabled = false;
       }
     }
+  };
 
-    // -------- 結果の確認 --------
-
-    console.log("===== 取得結果 =====");
-    console.table(statuses);
-
-    const failed = statuses.filter(x =>
-      x.状態 !== "成功" && x.状態 !== "取得済み"
-    );
-
-    if (failed.length) {
-      console.warn(
-        `${failed.length}ライブラリはCSVに含まれません。`
-      );
-      console.table(failed);
-    }
-
-    if (completedIds.size > 0) {
-      await exportCsv(db, completedIds);
-    } else {
-      console.warn("取得成功分がないためCSVは出力しません");
-    }
-
-    console.log("処理終了。CSVと取得結果を確認してください。");
-
-    // CSV確認後の一時データ削除用
-    window.SP_EXPORT_RESET = () => {
-      db.close();
-      const req = indexedDB.deleteDatabase(databaseName);
-
-      req.onsuccess = () =>
-        console.log("一時保存データを削除しました");
-
-      req.onerror = () =>
-        console.error("一時データ削除失敗", req.error);
-
-      req.onblocked = () =>
-        console.warn("ほかのタブがデータベースを使用中");
-    };
-
-  } catch (err) {
-    console.error("全体処理を中断:", err);
-    console.log(
-      "保存済みデータは保持されます。" +
-      "同じコードを再実行すると再開を試みます。"
-    );
-  }
+  setStatus(
+    "削除候補CSVを選択してください。確認なしには削除しません。"
+  );
 })();
