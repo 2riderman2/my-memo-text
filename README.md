@@ -2,349 +2,368 @@
 (async () => {
   "use strict";
 
-  // PDF旧バージョン調査専用
-  // SharePointに対してGETのみ実行。削除しません。
+  // 全拡張子対象・100日以上前の旧バージョン調査
+  // GETのみ。削除処理は一切行わない。
 
-  const siteMatch = location.pathname.match(
+  const DAYS = 100;
+  const WORKERS = 2;
+  const GAP_MS = 250;
+
+  const match = location.pathname.match(
     /^\/(sites|teams)\/([^/]+)/i
   );
 
-  if (!siteMatch || !location.hostname.endsWith(".sharepoint.com")) {
-    alert("対象のSharePointサイトで実行してください。");
+  if (
+    !match ||
+    !location.hostname.endsWith(".sharepoint.com")
+  ) {
+    alert("対象SharePointサイトで実行してください。");
     return;
   }
 
   const site =
-    `${location.origin}/${siteMatch[1]}/${siteMatch[2]}`;
+    `${location.origin}/${match[1]}/${match[2]}`;
 
-  const sitePath = new URL(site).pathname.toLowerCase() + "/";
-  const dbName = "SP_PDF_VERSION_AUDIT_V1_" + site;
-
-  const DAYS = 100;
-  const CONCURRENCY = 2;
-  const PAUSE_MS = 150;
+  const sitePrefix =
+    new URL(site).pathname.toLowerCase() + "/";
 
   const sleep = ms =>
-    new Promise(resolve => setTimeout(resolve, ms));
+    new Promise(r => setTimeout(r, ms));
 
-  const headers = {
+  const h = {
     Accept: "application/json;odata=verbose"
   };
 
   // ---------- 操作パネル ----------
 
-  function createPanel() {
-    document.getElementById("sp-pdf-version-tool")?.remove();
+  function panel() {
+    document.getElementById(
+      "sp-all-version-audit"
+    )?.remove();
 
-    const panel = document.createElement("section");
-    panel.id = "sp-pdf-version-tool";
+    const el = document.createElement("section");
+    el.id = "sp-all-version-audit";
 
-    panel.style.cssText = [
+    el.style.cssText = [
       "position:fixed",
+      "top:12px",
+      "right:12px",
       "z-index:2147483647",
-      "top:16px",
-      "right:16px",
-      "width:min(550px,92vw)",
-      "max-height:90vh",
+      "width:min(540px,92vw)",
+      "max-height:88vh",
       "overflow:auto",
-      "background:#fff",
+      "background:white",
       "color:#111",
-      "border:2px solid #2457a5",
-      "border-radius:12px",
-      "padding:17px",
-      "box-shadow:0 5px 28px #0006",
-      "font:14px/1.5 sans-serif"
+      "border:2px solid #2463a9",
+      "border-radius:8px",
+      "padding:16px",
+      "box-shadow:0 4px 16px #0005",
+      "font:14px sans-serif"
     ].join(";");
 
-    panel.innerHTML = `
-      <strong style="font-size:17px">
-        PDF旧バージョン調査（削除なし）
+    el.innerHTML = `
+      <strong>
+        全ファイル旧バージョン調査（削除なし）
       </strong>
       <p>
-        以前作成した「SharePoint_全ファイル一覧.csv」を
-        選択してください。
+        全ファイル一覧CSVを指定してください。
+        PDF以外も対象です。
       </p>
-      <input id="sp-audit-file"
-             type="file"
-             accept=".csv,text/csv"
-             style="width:100%">
-      <p id="sp-audit-status">待機中</p>
-      <button id="sp-audit-run">調査を開始</button>
-      <button id="sp-audit-download" disabled>
-        調査結果CSVを保存
-      </button>
-      <button id="sp-audit-reset">
-        保存済み進捗を消去
-      </button>
+      <input data-file type="file" accept=".csv">
+      <p data-status>待機中</p>
+      <button data-start>調査開始／続きから再開</button>
+      <button data-stop disabled>停止</button>
+      <button data-csv disabled>調査CSV保存</button>
+      <button data-reset>進捗削除</button>
       <p style="font-size:12px">
-        取得済みの進捗はブラウザ内に一時保存されます。
-        このスクリプトはファイルを削除しません。
+        同じCSV・同じブラウザでは調査済み結果を
+        再利用します。新たな100日判定をしたい
+        ときは進捗削除を行ってください。
       </p>
     `;
 
-    document.body.appendChild(panel);
+    document.body.appendChild(el);
+
+    const q = x =>
+      el.querySelector(`[data-${x}]`);
 
     return {
-      file: panel.querySelector("#sp-audit-file"),
-      run: panel.querySelector("#sp-audit-run"),
-      download: panel.querySelector("#sp-audit-download"),
-      reset: panel.querySelector("#sp-audit-reset"),
-      status: panel.querySelector("#sp-audit-status")
+      file: q("file"),
+      start: q("start"),
+      stop: q("stop"),
+      csv: q("csv"),
+      reset: q("reset"),
+      status: q("status")
     };
   }
 
-  const ui = createPanel();
+  const ui = panel();
 
-  function setStatus(message) {
-    ui.status.textContent = message;
-    console.log(message);
-  }
+  const status = s => {
+    ui.status.textContent = s;
+    console.log(s);
+  };
 
-  // ---------- CSV読込 ----------
+  let stop = false;
+  let running = false;
+  let activeDB = null;
+  let currentDbName = "";
 
-  function parseCSV(text) {
-    text = text.replace(/^\uFEFF/, "");
+  // ---------- CSV読み込み ----------
 
-    const rows = [];
+  function parseCSV(s) {
+    s = s.replace(/^\uFEFF/, "");
+
+    const out = [];
     let row = [];
     let cell = "";
-    let quoted = false;
+    let inQuotes = false;
 
-    for (let i = 0; i < text.length; i++) {
-      const c = text[i];
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
 
-      if (quoted) {
-        if (c === '"' && text[i + 1] === '"') {
+      if (inQuotes) {
+        if (c === '"' && s[i + 1] === '"') {
           cell += '"';
           i++;
         } else if (c === '"') {
-          quoted = false;
+          inQuotes = false;
         } else {
           cell += c;
         }
       } else if (c === '"') {
-        quoted = true;
+        inQuotes = true;
       } else if (c === ",") {
         row.push(cell);
         cell = "";
       } else if (c === "\r" || c === "\n") {
-        if (c === "\r" && text[i + 1] === "\n") i++;
+        if (c === "\r" && s[i + 1] === "\n") {
+          i++;
+        }
 
         row.push(cell);
-        cell = "";
 
-        if (row.some(x => x !== "")) {
-          rows.push(row);
+        if (row.some(v => v !== "")) {
+          out.push(row);
         }
 
         row = [];
+        cell = "";
       } else {
         cell += c;
       }
     }
 
-    if (quoted) {
-      throw new Error("CSVの引用符が閉じられていません");
+    if (inQuotes) {
+      throw Error(
+        "CSVの引用符が閉じられていません"
+      );
     }
 
-    if (cell.length || row.length) {
+    if (cell !== "" || row.length) {
       row.push(cell);
-      rows.push(row);
+      out.push(row);
     }
 
-    return rows;
+    return out;
   }
 
-  // ---------- REST API ----------
+  // ---------- SharePoint REST API ----------
 
-  async function getJson(url) {
-    for (let attempt = 0; attempt < 7; attempt++) {
-      let response;
+  async function getJSON(url) {
+    for (let n = 0; n < 7; n++) {
+      let r;
 
       try {
-        response = await fetch(url, {
-          method: "GET",
+        r = await fetch(url, {
           credentials: "same-origin",
-          headers
+          headers: h
         });
-      } catch (error) {
-        if (attempt === 6) throw error;
+      } catch (e) {
+        if (n === 6) throw e;
 
         await sleep(
-          Math.min(1500 * 2 ** attempt, 60000)
+          Math.min(1500 * 2 ** n, 60000)
         );
         continue;
       }
 
-      if (response.ok) {
-        return response.json();
+      if (r.ok) {
+        return r.json();
       }
-
-      const errorText =
-        (await response.text()).slice(0, 180);
 
       if (
-        ![429, 500, 502, 503, 504].includes(response.status) ||
-        attempt === 6
+        ![429, 500, 502, 503, 504].includes(r.status) ||
+        n === 6
       ) {
-        const error = new Error(
-          `HTTP ${response.status} ${errorText}`
+        throw Error(
+          `HTTP ${r.status}: ` +
+          (await r.text()).slice(0, 120)
         );
-        error.status = response.status;
-        throw error;
       }
 
-      const retry = Number(
-        response.headers.get("Retry-After")
+      const ra = Number(
+        r.headers.get("Retry-After")
       );
 
       await sleep(
-        Number.isFinite(retry) && retry > 0
-          ? retry * 1000
-          : Math.min(1500 * 2 ** attempt, 60000)
+        ra > 0
+          ? ra * 1000
+          : Math.min(1500 * 2 ** n, 60000)
       );
     }
   }
 
-  function escapeLiteral(value) {
-    return encodeURIComponent(
-      value.replace(/'/g, "''")
-    ).replace(/'/g, "%27");
-  }
-
-  function versionEndpoint(path) {
-    return (
-      site +
-      "/_api/web/GetFileByServerRelativePath(decodedurl='" +
-      escapeLiteral(path) +
-      "')/Versions"
+  const literal = x =>
+    encodeURIComponent(
+      x.replace(/'/g, "''")
     );
-  }
 
-  function getNext(next) {
-    if (!next) return null;
+  const base = p =>
+    `${site}/_api/web/` +
+    `GetFileByServerRelativePath(` +
+    `decodedurl='${literal(p)}')`;
 
-    const url = new URL(next, site);
+  function nextURL(s) {
+    if (!s) return null;
+
+    const u = new URL(s, site);
 
     if (
-      url.origin !== location.origin ||
-      !url.pathname.toLowerCase().startsWith(
-        sitePath + "_api/"
+      u.origin !== location.origin ||
+      !u.pathname.toLowerCase().startsWith(
+        sitePrefix + "_api/"
       )
     ) {
-      throw new Error("不正なページ送り先です");
+      throw Error("不正な次ページURL");
     }
 
-    return url.href;
+    return u.href;
   }
 
-  async function getVersions(path) {
-    const versions = [];
-    let url = versionEndpoint(path) + "?$top=200";
-    let pageCount = 0;
+  async function versions(path) {
+    let url =
+      base(path) + "/Versions?$top=200";
+
+    let pages = 0;
+    const out = [];
 
     while (url) {
-      pageCount++;
-
-      if (pageCount > 200) {
-        throw new Error(
-          "バージョン履歴がページ上限を超えました"
+      if (++pages > 500) {
+        throw Error(
+          "バージョン履歴のページ数上限"
         );
       }
 
-      const data = await getJson(url);
+      const data = await getJSON(url);
 
       if (!Array.isArray(data?.d?.results)) {
-        throw new Error(
-          "バージョンAPIの応答形式が予想外です"
+        throw Error(
+          "バージョン履歴の応答形式が不正"
         );
       }
 
-      versions.push(...data.d.results);
-      url = getNext(data.d.__next);
+      out.push(...data.d.results);
+
+      url = nextURL(data.d.__next);
     }
 
-    return versions;
+    return out;
   }
 
-  // ---------- 進捗保存 ----------
+  // ---------- IndexedDB進捗保存 ----------
 
-  function openDb() {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(dbName, 1);
+  function dbOpen(name) {
+    return new Promise((ok, ng) => {
+      const r = indexedDB.open(name, 1);
 
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        db.createObjectStore("files", {
-          keyPath: "path"
-        });
-        db.createObjectStore("meta", {
-          keyPath: "key"
-        });
+      r.onupgradeneeded = () => {
+        r.result.createObjectStore(
+          "results",
+          { keyPath: "path" }
+        );
       };
 
-      request.onsuccess = () =>
-        resolve(request.result);
+      r.onsuccess = () =>
+        ok(r.result);
 
-      request.onerror = () =>
-        reject(request.error);
+      r.onerror = () =>
+        ng(r.error);
     });
   }
 
-  function dbGet(db, store, key) {
-    return new Promise((resolve, reject) => {
-      const request = db
-        .transaction(store, "readonly")
-        .objectStore(store)
-        .get(key);
+  const dbGet = (db, path) =>
+    new Promise((ok, ng) => {
+      const r = db
+        .transaction("results", "readonly")
+        .objectStore("results")
+        .get(path);
 
-      request.onsuccess = () =>
-        resolve(request.result);
+      r.onsuccess = () =>
+        ok(r.result);
 
-      request.onerror = () =>
-        reject(request.error);
+      r.onerror = () =>
+        ng(r.error);
     });
-  }
 
-  function dbPut(db, store, value) {
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(store, "readwrite");
-      tx.objectStore(store).put(value);
+  const dbPut = (db, item) =>
+    new Promise((ok, ng) => {
+      const tx = db.transaction(
+        "results",
+        "readwrite"
+      );
 
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error);
+      tx.objectStore("results").put(item);
+
+      tx.oncomplete = ok;
+
+      tx.onerror = () =>
+        ng(tx.error);
+
+      tx.onabort = () =>
+        ng(tx.error);
     });
-  }
 
   // ---------- CSV出力 ----------
 
-  function csvCell(value) {
-    let s = String(value ?? "");
+  function csvCell(v) {
+    let s = String(v ?? "");
 
-    if (/^\s*[=+@\-]/.test(s)) {
+    if (/^\s*[=+\-@]/.test(s)) {
       s = "'" + s;
     }
 
-    return '"' + s.replace(/"/g, '""') + '"';
+    return '"' +
+      s.replace(/"/g, '""') +
+      '"';
   }
 
-  function downloadCsv(filename, header, rows) {
-    const content =
-      "\uFEFF" +
-      [header, ...rows]
-        .map(r => r.map(csvCell).join(","))
-        .join("\r\n") +
-      "\r\n";
+  function saveCSV(filename, head, rows) {
+    const batches = [
+      "\uFEFF",
+      head.map(csvCell).join(",") + "\r\n"
+    ];
 
-    const blob = new Blob([content], {
+    for (
+      let i = 0;
+      i < rows.length;
+      i += 3000
+    ) {
+      batches.push(
+        rows.slice(i, i + 3000)
+          .map(r => r.map(csvCell).join(","))
+          .join("\r\n") + "\r\n"
+      );
+    }
+
+    const blob = new Blob(batches, {
       type: "text/csv;charset=utf-8"
     });
 
-    const url = URL.createObjectURL(blob);
+    const u = URL.createObjectURL(blob);
     const a = document.createElement("a");
 
-    a.href = url;
+    a.href = u;
     a.download = filename;
 
     document.body.appendChild(a);
@@ -352,11 +371,11 @@
     a.remove();
 
     setTimeout(() => {
-      URL.revokeObjectURL(url);
+      URL.revokeObjectURL(u);
     }, 60000);
   }
 
-  const outputHeader = [
+  const head = [
     "状態",
     "ライブラリ名",
     "ファイル名",
@@ -369,207 +388,259 @@
     "備考"
   ];
 
-  let db = null;
-  let outputRows = [];
+  // ---------- 入力CSV確認 ----------
+
+  async function parseInput() {
+    if (!ui.file.files.length) {
+      throw Error(
+        "全ファイル一覧CSVを選択してください"
+      );
+    }
+
+    const text =
+      await ui.file.files[0].text();
+
+    const bytes =
+      new TextEncoder().encode(text);
+
+    const hash = Array.from(
+      new Uint8Array(
+        await crypto.subtle.digest(
+          "SHA-256",
+          bytes
+        )
+      ),
+      x => x.toString(16).padStart(2, "0")
+    ).join("");
+
+    const records = parseCSV(text);
+    const headers = records.shift();
+
+    if (!headers) {
+      throw Error("空のCSVです");
+    }
+
+    const p = headers.indexOf("ファイルパス");
+    const n = headers.indexOf("ファイル名");
+    const l = headers.indexOf("ライブラリ名");
+
+    if ([p, n, l].some(x => x < 0)) {
+      throw Error(
+        "ライブラリ名・ファイル名・" +
+        "ファイルパスの列が必要です"
+      );
+    }
+
+    const files = new Map();
+    const errors = [];
+
+    for (const r of records) {
+      const path = r[p] || "";
+      const name = r[n] || "";
+      const library = r[l] || "";
+
+      if (!path && !name) continue;
+
+      if (
+        !path.startsWith("/") ||
+        !path.toLowerCase().startsWith(
+          sitePrefix
+        ) ||
+        !name
+      ) {
+        errors.push([
+          "取得失敗",
+          library,
+          name,
+          path,
+          "",
+          "",
+          "",
+          "",
+          "",
+          "サイト外・パス不正"
+        ]);
+      } else {
+        files.set(path, {
+          path,
+          name,
+          library
+        });
+      }
+    }
+
+    return {
+      files: [...files.values()],
+      errors,
+      hash
+    };
+  }
+
+  async function prepare() {
+    const input = await parseInput();
+
+    const name =
+      "SP_ALL_VERSION_AUDIT_V3_" +
+      site + "_" + input.hash;
+
+    if (
+      activeDB &&
+      currentDbName !== name
+    ) {
+      activeDB.close();
+      activeDB = null;
+    }
+
+    if (!activeDB) {
+      activeDB = await dbOpen(name);
+      currentDbName = name;
+    }
+
+    const meta = await dbGet(
+      activeDB,
+      "__META__"
+    );
+
+    if (!meta) {
+      await dbPut(activeDB, {
+        path: "__META__",
+        cutoff: new Date(
+          Date.now() - DAYS * 86400000
+        ).toISOString()
+      });
+    }
+
+    input.cutoff = (
+      await dbGet(activeDB, "__META__")
+    ).cutoff;
+
+    return input;
+  }
+
+  // ---------- 停止ボタン ----------
+
+  ui.stop.onclick = () => {
+    stop = true;
+
+    status(
+      "停止要求を受け付けました。" +
+      "処理中のファイルを終えて停止します。"
+    );
+  };
 
   // ---------- 調査開始 ----------
 
-  ui.run.onclick = async () => {
-    if (!ui.file.files.length) {
-      alert("全ファイル一覧CSVを選択してください");
-      return;
-    }
+  ui.start.onclick = async () => {
+    if (running) return;
 
-    ui.run.disabled = true;
+    running = true;
+    stop = false;
+
+    ui.start.disabled = true;
     ui.reset.disabled = true;
-    ui.download.disabled = true;
+    ui.stop.disabled = false;
+    ui.csv.disabled = true;
 
     try {
-      const text = await ui.file.files[0].text();
-      const parsed = parseCSV(text);
+      const input = await prepare();
 
-      if (!parsed.length) {
-        throw new Error("CSVが空です");
-      }
+      const cutoff =
+        Date.parse(input.cutoff);
 
-      const header = parsed.shift();
-
-      const pathIndex = header.indexOf("ファイルパス");
-      const nameIndex = header.indexOf("ファイル名");
-      const libIndex = header.indexOf("ライブラリ名");
-
-      if (
-        pathIndex < 0 ||
-        nameIndex < 0 ||
-        libIndex < 0
-      ) {
-        throw new Error(
-          "CSVにファイルパス、ファイル名、ライブラリ名が必要です"
-        );
-      }
-
-      const invalid = [];
-      const selected = new Map();
-
-      for (const row of parsed) {
-        const name = row[nameIndex] || "";
-        const path = row[pathIndex] || "";
-
-        if (!/\.pdf$/i.test(name)) continue;
-
-        if (
-          !path.toLowerCase().startsWith(sitePath) ||
-          !/\.pdf$/i.test(path)
-        ) {
-          invalid.push([
-            "取得失敗",
-            row[libIndex],
-            name,
-            path,
-            "",
-            "",
-            "",
-            "",
-            "",
-            "異なるサイトまたは不正なPDFパス"
-          ]);
-          continue;
-        }
-
-        selected.set(path, {
-          path,
-          name,
-          library: row[libIndex] || ""
-        });
-      }
-
-      const files = [...selected.values()];
-
-      db = await openDb();
-
-      let meta = await dbGet(db, "meta", "job");
-
-      if (!meta) {
-        meta = {
-          key: "job",
-          cutoff: new Date(
-            Date.now() - DAYS * 86400000
-          ).toISOString(),
-          site
-        };
-
-        await dbPut(db, "meta", meta);
-      }
-
-      if (meta.site !== site) {
-        throw new Error(
-          "別サイトの保存済み進捗が存在します"
-        );
-      }
-
-      const cutoffMs = Date.parse(meta.cutoff);
-
-      setStatus(
-        `PDF ${files.length.toLocaleString()}件を調査します。` +
-        `基準日時：${meta.cutoff}`
-      );
+      const files = input.files;
 
       let index = 0;
       let done = 0;
-      let errors = 0;
-      let found = 0;
-      let cached = 0;
+      let fail = 0;
+      let candidates = 0;
+
+      status(
+        `全形式 ${files.length.toLocaleString()}` +
+        `ファイルを調査。基準日時 ${input.cutoff}`
+      );
 
       async function worker() {
-        while (index < files.length) {
-          const file = files[index++];
+        while (!stop && index < files.length) {
+          const f = files[index++];
 
-          const existing = await dbGet(
-            db,
-            "files",
-            file.path
+          const cached = await dbGet(
+            activeDB,
+            f.path
           );
 
-          if (existing?.done) {
-            cached++;
-            found += existing.candidates.length;
+          if (cached?.complete) {
             done++;
+            candidates += cached.rows.length;
             continue;
           }
 
           try {
-            const versions = await getVersions(
-              file.path
-            );
+            const vs = await versions(f.path);
+            const rows = [];
 
-            const candidates = [];
-
-            for (const version of versions) {
-              if (version.IsCurrentVersion === true) {
+            for (const v of vs) {
+              if (
+                v.IsCurrentVersion === true
+              ) {
                 continue;
               }
 
-              const created = Date.parse(
-                version.Created || ""
+              const id = Number(
+                v.ID ?? v.Id
               );
 
-              const id = Number(
-                version.ID ?? version.Id
+              const created = Date.parse(
+                v.Created || ""
+              );
+
+              const label = String(
+                v.VersionLabel ?? ""
               );
 
               if (
                 !Number.isSafeInteger(id) ||
-                id <= 0 ||
-                !Number.isFinite(created)
+                id < 0 ||
+                !Number.isFinite(created) ||
+                !label
               ) {
-                throw new Error(
-                  "バージョンIDまたは作成日時が不正"
+                throw Error(
+                  "バージョンID・日時・" +
+                  "番号の取得に失敗"
                 );
               }
 
-              if (created <= cutoffMs) {
-                const size =
-                  version.Length ??
-                  version.Size ??
-                  "";
-
-                candidates.push([
+              if (created <= cutoff) {
+                rows.push([
                   "削除候補",
-                  file.library,
-                  file.name,
-                  file.path,
+                  f.library,
+                  f.name,
+                  f.path,
                   id,
-                  version.VersionLabel ?? "",
-                  version.Created ?? "",
-                  size,
-                  meta.cutoff,
+                  label,
+                  v.Created ?? "",
+                  v.Length ?? v.Size ?? "",
+                  input.cutoff,
                   ""
                 ]);
               }
             }
 
-            await dbPut(db, "files", {
-              path: file.path,
-              done: true,
-              candidates
+            await dbPut(activeDB, {
+              path: f.path,
+              complete: true,
+              rows
             });
 
-            found += candidates.length;
+            candidates += rows.length;
 
-          } catch (error) {
-            errors++;
+          } catch (e) {
+            fail++;
 
-            await dbPut(db, "files", {
-              path: file.path,
-              done: false,
-              error: String(error.message)
+            await dbPut(activeDB, {
+              path: f.path,
+              complete: false,
+              error: String(e.message)
             });
-
-            console.warn(
-              "取得失敗:",
-              file.path,
-              error.message
-            );
           }
 
           done++;
@@ -578,16 +649,15 @@
             done % 25 === 0 ||
             done === files.length
           ) {
-            setStatus(
+            status(
               `進捗 ${done.toLocaleString()}/` +
-              `${files.length.toLocaleString()} PDF / ` +
-              `候補 ${found.toLocaleString()}件 / ` +
-              `エラー ${errors}件 / ` +
-              `保存済み ${cached}件`
+              `${files.length.toLocaleString()}・` +
+              `候補 ${candidates.toLocaleString()}・` +
+              `今回失敗 ${fail}`
             );
           }
 
-          await sleep(PAUSE_MS);
+          await sleep(GAP_MS);
         }
       }
 
@@ -595,7 +665,7 @@
         Array.from(
           {
             length: Math.min(
-              CONCURRENCY,
+              WORKERS,
               files.length
             )
           },
@@ -603,108 +673,129 @@
         )
       );
 
-      outputRows = [...invalid];
-      let incomplete = invalid.length;
+      const rows = [...input.errors];
 
-      for (const file of files) {
-        const result = await dbGet(
-          db,
-          "files",
-          file.path
+      let failed = input.errors.length;
+      let found = 0;
+      let bytes = 0;
+
+      for (const f of files) {
+        const x = await dbGet(
+          activeDB,
+          f.path
         );
 
-        if (result?.done) {
-          outputRows.push(...result.candidates);
-        } else {
-          incomplete++;
+        if (x?.complete) {
+          rows.push(...x.rows);
+          found += x.rows.length;
 
-          outputRows.push([
-            "取得失敗",
-            file.library,
-            file.name,
-            file.path,
+          for (const r of x.rows) {
+            bytes += Number(r[7]) || 0;
+          }
+
+        } else {
+          failed++;
+
+          rows.push([
+            x ? "取得失敗" : "未調査",
+            f.library,
+            f.name,
+            f.path,
             "",
             "",
             "",
             "",
-            meta.cutoff,
-            result?.error || "未取得"
+            input.cutoff,
+            x?.error || "停止・未調査"
           ]);
         }
       }
 
-      const candidates = outputRows.filter(
-        r => r[0] === "削除候補"
-      );
+      ui.csv.disabled = false;
 
-      const bytes = candidates.reduce(
-        (sum, r) => sum + (Number(r[7]) || 0),
-        0
-      );
-
-      setStatus(
-        `調査終了：PDF ${files.length.toLocaleString()}件 / ` +
-        `削除候補 ${candidates.length.toLocaleString()}件 / ` +
-        `推定対象容量 ` +
-        `${(bytes / 1073741824).toFixed(2)} GiB / ` +
-        `失敗 ${incomplete}件`
-      );
-
-      ui.download.disabled = false;
-
-      ui.download.onclick = () => {
-        downloadCsv(
-          "SharePoint_PDF旧バージョン削除候補.csv",
-          outputHeader,
-          outputRows
+      ui.csv.onclick = () =>
+        saveCSV(
+          "SharePoint_全形式_旧バージョン調査.csv",
+          head,
+          rows
         );
-      };
 
-      console.table({
-        PDFファイル数: files.length,
-        削除候補数: candidates.length,
-        取得失敗数: incomplete
-      });
+      status(
+        `調査${stop ? "途中停止" : "終了"}。` +
+        `候補${found.toLocaleString()}件・` +
+        `推定${(bytes / 1073741824).toFixed(2)}GiB・` +
+        `失敗／未調査${failed}件。` +
+        `［調査CSV保存］で保存してください。`
+      );
 
-    } catch (error) {
-      console.error(error);
-      setStatus("調査エラー：" + error.message);
+      if (failed) {
+        console.warn(
+          "未取得・未調査のファイルがあります。" +
+          "CSVで確認してください。"
+        );
+      }
+
+    } catch (e) {
+      console.error(e);
+      status("エラー: " + e.message);
 
     } finally {
-      ui.run.disabled = false;
+      running = false;
+      ui.start.disabled = false;
       ui.reset.disabled = false;
+      ui.stop.disabled = true;
     }
   };
 
-  // ---------- 調査データ初期化 ----------
+  // ---------- 進捗初期化 ----------
 
   ui.reset.onclick = async () => {
+    if (running) return;
+
     if (!confirm(
-      "保存済み調査進捗を消去して、最初から調べ直しますか？"
+      "選択中の全ファイル一覧CSVに対応する" +
+      "調査済みデータを削除しますか？"
     )) {
       return;
     }
 
-    if (db) {
-      db.close();
-      db = null;
+    try {
+      const input = await parseInput();
+
+      const name =
+        "SP_ALL_VERSION_AUDIT_V3_" +
+        site + "_" + input.hash;
+
+      if (activeDB) {
+        activeDB.close();
+        activeDB = null;
+        currentDbName = "";
+      }
+
+      const r =
+        indexedDB.deleteDatabase(name);
+
+      r.onsuccess = () =>
+        status(
+          "このCSVに対応する調査進捗を削除しました"
+        );
+
+      r.onerror = () =>
+        status(
+          "削除失敗: " + r.error
+        );
+
+      r.onblocked = () =>
+        status(
+          "別タブが調査データベースを使用しています"
+        );
+
+    } catch (e) {
+      status("エラー: " + e.message);
     }
-
-    const request = indexedDB.deleteDatabase(
-      dbName
-    );
-
-    request.onsuccess = () =>
-      setStatus("保存済み調査進捗を消去しました");
-
-    request.onerror = () =>
-      setStatus("消去失敗：" + request.error);
-
-    request.onblocked = () =>
-      setStatus("別のタブがデータベースを使用中です");
   };
 
-  setStatus(
-    "準備完了。CSVを選択して調査を開始してください。"
+  status(
+    "準備完了。CSVを選んで調査開始してください。"
   );
 })();
