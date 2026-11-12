@@ -1,11 +1,11 @@
 let
     txt = [摘要],
-    pos = if txt = null then -1 else Text.PositionOf(txt, "）")
+    pos = if txt = null then -1 else Text.PositionOf(txt, "（")
 in
     if txt <> null
-        and Text.Contains(txt, "加除式図書")
+        and Text.Contains(txt, "健康診断")
         and pos >= 0
     then
-        Text.Start(txt, pos + 1)
+        Text.Start(txt, pos)
     else
         txt
