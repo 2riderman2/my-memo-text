@@ -1,9 +1,12 @@
 let
     txt = [摘要],
-    pos = if txt = null then -1 else Text.PositionOf(txt, "（")
+    digits = "０１２３４５６７８９",
+    pos =
+        if txt = null then -1
+        else Text.PositionOfAny(txt, Text.ToList(digits))
 in
     if txt <> null
-        and Text.Contains(txt, "健康診断")
+        and Text.Contains(txt, "非常勤賞与")
         and pos >= 0
     then
         Text.Start(txt, pos)
