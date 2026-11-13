@@ -1,14 +1,42 @@
-let
-    txt = [摘要],
-    digits = "０１２３４５６７８９",
-    pos =
-        if txt = null then -1
-        else Text.PositionOfAny(txt, Text.ToList(digits))
-in
-    if txt <> null
-        and Text.Contains(txt, "非常勤賞与")
-        and pos >= 0
-    then
-        Text.Start(txt, pos)
-    else
-        txt
+
+=LET(
+  major,[@大分類],
+  vendor,[@取引先],
+  minor,[@小分類],
+  hit,
+    (tbl分類ルール[有効]="○")*
+    (tbl分類ルール[優先順位]<>"")*
+    --(((tbl分類ルール[大分類]="")+
+        (tbl分類ルール[大分類]=major))>0)*
+    IF(
+      tbl分類ルール[取引先条件]="",
+      1,
+      IF(
+        tbl分類ルール[取引先判定]="完全一致",
+        --(tbl分類ルール[取引先条件]=vendor),
+        --ISNUMBER(SEARCH(tbl分類ルール[取引先条件],vendor))
+      )
+    )*
+    IF(
+      tbl分類ルール[小分類条件]="",
+      1,
+      IF(
+        tbl分類ルール[小分類判定]="完全一致",
+        --(tbl分類ルール[小分類条件]=minor),
+        --ISNUMBER(SEARCH(tbl分類ルール[小分類条件],minor))
+      )
+    )*
+    --(((tbl分類ルール[取引先条件]<>"")+
+        (tbl分類ルール[小分類条件]<>""))>0),
+  IFERROR(
+    INDEX(
+      SORTBY(
+        FILTER(tbl分類ルール[中分類],hit),
+        FILTER(tbl分類ルール[優先順位],hit),
+        1
+      ),
+      1
+    ),
+    "未分類"
+  )
+)
